@@ -494,13 +494,17 @@ static int fl2000_connector_detect_ctx(struct drm_connector *connector,
 {
 	struct fl2000_device *fl = to_fl2000(connector->dev);
 	enum drm_connector_status status = connector_status_disconnected;
+	union fl2000_vga_status_reg vga = {};
 	u32 data;
 	int idx;
 
 	if (!drm_dev_enter(connector->dev, &idx))
 		return connector_status_disconnected;
 
-	if (fl2000_it66121_connected(fl) ||
+	/* VGA load sense works even with monitors/cables that have no DDC lines */
+	regmap_read(fl->regmap, FL2000_VGA_STATUS_REG, &vga.val);
+
+	if (vga.monitor_status || fl2000_it66121_connected(fl) ||
 	    !fl2000_i2c_dword(fl, true, FL2000_VGA_DDC_ADDR, 0, &data))
 		status = connector_status_connected;
 
