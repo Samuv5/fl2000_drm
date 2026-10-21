@@ -348,6 +348,9 @@ static int fl2000_crtc_atomic_check(struct drm_crtc *crtc, struct fl2000_atomic_
 {
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
+	if (!crtc_state->enable)
+		return 0;
+
 	return drm_atomic_helper_check_crtc_primary_plane(crtc_state);
 }
 

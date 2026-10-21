@@ -46,8 +46,10 @@ static int fl2000_reg_read(void *context, unsigned int reg, unsigned int *val)
 	if (ret == sizeof(*data)) {
 		*val = le32_to_cpu(*data);
 		ret = 0;
-	} else if (ret >= 0) {
-		ret = -EIO;
+	} else {
+		dev_dbg(&fl->intf->dev, "reg read 0x%04x failed: %d\n", reg, ret);
+		if (ret >= 0)
+			ret = -EIO;
 	}
 
 	kfree(data);
@@ -314,8 +316,14 @@ static int __fl2000_i2c_dword(struct fl2000_device *fl, bool read, u16 addr, u8 
 	 * USB must be always available so no I/O errors. But if it happens we are probably in
 	 * irreversible HW issue
 	 */
-	if (ret || reg.i2c_status != 0)
+	if (ret || reg.i2c_status != 0) {
+		u32 rd = 0;
+
+		regmap_read(regmap, FL2000_VGA_I2C_RD_REG, &rd);
+		dev_dbg(&fl->intf->dev, "i2c 0x%02x[0x%02x] poll %d, sc 0x%08x, rd 0x%08x\n", addr,
+			offset, ret, reg.val, rd);
 		return -EIO;
+	}
 
 	if (read) {
 		ret = regmap_read(regmap, FL2000_VGA_I2C_RD_REG, data);
@@ -334,6 +342,9 @@ int fl2000_i2c_dword(struct fl2000_device *fl, bool read, u16 addr, u8 offset, u
 	mutex_lock(&fl->i2c_lock);
 	ret = __fl2000_i2c_dword(fl, read, addr, offset, data);
 	mutex_unlock(&fl->i2c_lock);
+
+	dev_dbg(&fl->intf->dev, "i2c %s 0x%02x[0x%02x] = 0x%08x: %d\n", read ? "rd" : "wr", addr,
+		offset, *data, ret);
 
 	return ret;
 }

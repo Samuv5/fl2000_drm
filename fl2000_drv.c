@@ -112,6 +112,14 @@ static int fl2000_probe(struct usb_interface *intf, const struct usb_device_id *
 		return ret;
 	}
 
+	{
+		union fl2000_vga_status_reg status = {};
+
+		regmap_read(fl->regmap, FL2000_VGA_STATUS_REG, &status.val);
+		dev_dbg(&intf->dev, "status 0x%08x: monitor %d edid %d hdmi %d\n", status.val,
+			status.monitor_status, status.edid_status, status.hdmi_status);
+	}
+
 	/* Optional HDMI transmitter; without it this is a VGA-only adapter */
 	ret = fl2000_it66121_probe(fl);
 	if (ret == -ENODEV)
