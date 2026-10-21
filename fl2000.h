@@ -16,6 +16,7 @@
 #include <linux/scatterlist.h>
 #include <linux/spinlock.h>
 #include <linux/usb.h>
+#include <linux/workqueue.h>
 
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
@@ -33,6 +34,8 @@
 #endif
 
 #define DRIVER_NAME "fl2000"
+
+#define FL2000_EP_STREAM 1
 
 /* Streaming: buffers in flight never exceed URB count, plus the latest frame, plus one to draw */
 #define FL2000_STREAM_URBS 2
@@ -56,7 +59,11 @@ struct fl2000_stream {
 	unsigned int height;
 	unsigned int bytes_pix;
 	int latest;
-	bool running;
+	bool enabled; /* Between fl2000_stream_start() and fl2000_stream_stop() */
+	bool running; /* URBs are being resubmitted */
+	int error; /* Last transfer error, handled by recover work */
+	unsigned int retries;
+	struct work_struct recover;
 };
 
 struct fl2000_pll {

@@ -20,7 +20,7 @@
 
 #include "fl2000.h"
 
-#define FL2000_EP_STREAM 1
+#define FL2000_STREAM_MAX_RETRIES 10
 
 static void fl2000_buf_free(struct fl2000_buf *buf)
 {
@@ -125,16 +125,22 @@ static void fl2000_stream_complete(struct urb *urb)
 
 	switch (urb->status) {
 	case 0:
+		stream->retries = 0;
 		break;
-	case -ENOENT: /* Killed by fl2000_stream_stop() */
+	case -ENOENT: /* Killed by fl2000_stream_stop() or recover work */
 	case -ECONNRESET:
 	case -ESHUTDOWN: /* Device unplugged */
 	case -ENODEV:
 		stream->running = false;
 		break;
 	default:
-		drm_err_ratelimited(&fl->drm, "Frame transfer failed (%d), stopping\n", urb->status);
-		stream->running = false;
+		/* Transient error or stalled endpoint: restart from process context */
+		if (stream->running) {
+			stream->running = false;
+			stream->error = urb->status;
+			if (stream->enabled)
+				schedule_work(&stream->recover);
+		}
 		break;
 	}
 
@@ -144,18 +150,59 @@ static void fl2000_stream_complete(struct urb *urb)
 	spin_unlock_irqrestore(&stream->lock, flags);
 }
 
+static void fl2000_stream_kill_urbs(struct fl2000_stream *stream)
+{
+	/* Waits for completion handlers, which will not resubmit anymore */
+	for (int i = 0; i < FL2000_STREAM_URBS; i++)
+		usb_kill_urb(stream->urbs[i]);
+}
+
+static void fl2000_stream_recover(struct work_struct *work)
+{
+	struct fl2000_stream *stream = container_of(work, struct fl2000_stream, recover);
+	struct fl2000_device *fl = container_of(stream, struct fl2000_device, stream);
+	unsigned long flags;
+	int error;
+
+	fl2000_stream_kill_urbs(stream);
+
+	spin_lock_irqsave(&stream->lock, flags);
+	error = stream->error;
+	if (++stream->retries > FL2000_STREAM_MAX_RETRIES) {
+		drm_err(&fl->drm, "Frame transfers keep failing (%d), giving up\n", error);
+		stream->enabled = false;
+	}
+	spin_unlock_irqrestore(&stream->lock, flags);
+
+	if (!stream->enabled)
+		return;
+
+	drm_dbg(&fl->drm, "Frame transfer failed (%d), restarting\n", error);
+
+	if (error == -EPIPE)
+		usb_clear_halt(fl->udev, usb_sndbulkpipe(fl->udev, FL2000_EP_STREAM));
+
+	spin_lock_irqsave(&stream->lock, flags);
+	if (stream->enabled && !stream->running) {
+		stream->running = true;
+		for (int i = 0; i < FL2000_STREAM_URBS && stream->running; i++)
+			fl2000_stream_submit(fl, i);
+	}
+	spin_unlock_irqrestore(&stream->lock, flags);
+}
+
 void fl2000_stream_stop(struct fl2000_device *fl)
 {
 	struct fl2000_stream *stream = &fl->stream;
 	unsigned long flags;
 
 	spin_lock_irqsave(&stream->lock, flags);
+	stream->enabled = false;
 	stream->running = false;
 	spin_unlock_irqrestore(&stream->lock, flags);
 
-	/* Waits for completion handlers, which will not resubmit anymore */
-	for (int i = 0; i < FL2000_STREAM_URBS; i++)
-		usb_kill_urb(stream->urbs[i]);
+	cancel_work_sync(&stream->recover);
+	fl2000_stream_kill_urbs(stream);
 }
 
 int fl2000_stream_start(struct fl2000_device *fl, unsigned int width, unsigned int height,
@@ -192,6 +239,8 @@ int fl2000_stream_start(struct fl2000_device *fl, unsigned int width, unsigned i
 	stream->latest = 0;
 	for (int i = 0; i < FL2000_STREAM_BUFS; i++)
 		stream->bufs[i].users = 0;
+	stream->retries = 0;
+	stream->enabled = true;
 	stream->running = true;
 	for (int i = 0; i < FL2000_STREAM_URBS && stream->running; i++)
 		fl2000_stream_submit(fl, i);
@@ -264,6 +313,7 @@ int fl2000_stream_init(struct fl2000_device *fl)
 	int ret;
 
 	spin_lock_init(&stream->lock);
+	INIT_WORK(&stream->recover, fl2000_stream_recover);
 
 	for (int i = 0; i < FL2000_STREAM_URBS; i++) {
 		struct urb *urb = usb_alloc_urb(0, GFP_KERNEL);

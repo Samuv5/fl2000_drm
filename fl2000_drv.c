@@ -50,6 +50,12 @@ static int fl2000_hw_init(struct fl2000_device *fl)
 	if (ret)
 		return ret;
 
+	ret = usb_pipe_type_check(fl->udev, usb_sndbulkpipe(fl->udev, FL2000_EP_STREAM));
+	if (ret) {
+		drm_err(&fl->drm, "No bulk OUT endpoint %d for streaming\n", FL2000_EP_STREAM);
+		return ret;
+	}
+
 	ret = fl2000_reset(fl);
 	if (ret)
 		return ret;
