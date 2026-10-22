@@ -8,3 +8,6 @@ modules.order
 Module.symvers
 .tmp_versions/
 *.o.d
+pkg/
+src/
+*.pkg.tar.zst
