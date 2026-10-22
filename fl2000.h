@@ -67,6 +67,7 @@ struct fl2000_stream {
 	int error; /* Last transfer error, handled by recover work */
 	unsigned int retries;
 	struct work_struct recover;
+	struct delayed_work watchdog;
 };
 
 struct fl2000_pll {

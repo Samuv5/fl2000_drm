@@ -22,6 +22,13 @@
 
 #define FL2000_STREAM_MAX_RETRIES 10
 
+/* The 16-bit frame counter in the VGA status register saturates after 65535 frames (18 min at
+ * 60 Hz) and the device then loses track of frame boundaries, drawing shifted images. An app
+ * reset clears it without disturbing the stream, so do one well before saturation.
+ */
+#define FL2000_WATCHDOG_PERIOD	   msecs_to_jiffies(5000)
+#define FL2000_FRAME_COUNT_RESET   0xF000
+
 static void fl2000_buf_free(struct fl2000_buf *buf)
 {
 	if (buf->vaddr)
@@ -196,6 +203,24 @@ static void fl2000_stream_recover(struct work_struct *work)
 	spin_unlock_irqrestore(&stream->lock, flags);
 }
 
+static void fl2000_stream_watchdog(struct work_struct *work)
+{
+	struct fl2000_stream *stream = container_of(to_delayed_work(work), struct fl2000_stream,
+						    watchdog);
+	struct fl2000_device *fl = container_of(stream, struct fl2000_device, stream);
+	union fl2000_vga_status_reg status = {};
+
+	if (regmap_read(fl->regmap, FL2000_VGA_STATUS_REG, &status.val))
+		return; /* Unplugged */
+
+	if (status.frame_cnt >= FL2000_FRAME_COUNT_RESET) {
+		dev_dbg(&fl->intf->dev, "frame counter %u, app reset\n", status.frame_cnt);
+		fl2000_reset(fl);
+	}
+
+	schedule_delayed_work(&stream->watchdog, FL2000_WATCHDOG_PERIOD);
+}
+
 void fl2000_stream_stop(struct fl2000_device *fl)
 {
 	struct fl2000_stream *stream = &fl->stream;
@@ -206,6 +231,7 @@ void fl2000_stream_stop(struct fl2000_device *fl)
 	stream->running = false;
 	spin_unlock_irqrestore(&stream->lock, flags);
 
+	cancel_delayed_work_sync(&stream->watchdog);
 	cancel_work_sync(&stream->recover);
 	fl2000_stream_kill_urbs(stream);
 }
@@ -251,6 +277,8 @@ int fl2000_stream_start(struct fl2000_device *fl, unsigned int width, unsigned i
 		fl2000_stream_submit(fl, i);
 	ret = stream->running ? 0 : -EIO;
 	spin_unlock_irqrestore(&stream->lock, flags);
+
+	schedule_delayed_work(&stream->watchdog, FL2000_WATCHDOG_PERIOD);
 
 	return ret;
 }
@@ -319,6 +347,7 @@ int fl2000_stream_init(struct fl2000_device *fl)
 
 	spin_lock_init(&stream->lock);
 	INIT_WORK(&stream->recover, fl2000_stream_recover);
+	INIT_DELAYED_WORK(&stream->watchdog, fl2000_stream_watchdog);
 
 	for (int i = 0; i < FL2000_STREAM_URBS; i++) {
 		struct urb *urb = usb_alloc_urb(0, GFP_KERNEL);
