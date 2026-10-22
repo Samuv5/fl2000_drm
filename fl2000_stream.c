@@ -177,10 +177,15 @@ static void fl2000_stream_recover(struct work_struct *work)
 	if (!stream->enabled)
 		return;
 
-	drm_dbg(&fl->drm, "Frame transfer failed (%d), restarting\n", error);
+	drm_warn(&fl->drm, "Frame transfer failed (%d), resynchronizing\n", error);
 
-	if (error == -EPIPE)
-		usb_clear_halt(fl->udev, usb_sndbulkpipe(fl->udev, FL2000_EP_STREAM));
+	/* Killed URBs left a partial frame in the device, which then keeps drawing shifted
+	 * frames: reprogram the mode (app reset + altsetting reselect, also clears a halt)
+	 */
+	if (fl2000_set_mode(fl, &fl->mode_pll, &fl->mode_timings, fl->mode_bytes_pix)) {
+		drm_err(&fl->drm, "Cannot resynchronize, stopping\n");
+		return;
+	}
 
 	spin_lock_irqsave(&stream->lock, flags);
 	if (stream->enabled && !stream->running) {

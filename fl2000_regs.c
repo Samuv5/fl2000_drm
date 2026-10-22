@@ -108,106 +108,78 @@ int fl2000_regmap_init(struct fl2000_device *fl)
 	return 0;
 }
 
-int fl2000_set_pll(struct fl2000_device *fl, const struct fl2000_pll *pll)
+/* Mode programming sequence of Fresco Logic's reference driver (fl2000_monitor_set_resolution(),
+ * then fl2000_dev_select_interface()); bit numbers kept as in their source for comparison
+ */
+int fl2000_set_mode(struct fl2000_device *fl, const struct fl2000_pll *pll,
+		    const struct fl2000_timings *t, u32 bytes_pix)
 {
 	struct regmap *regmap = fl->regmap;
 	union fl2000_vga_pll_reg pll_reg = { .val = 0 };
-	union fl2000_vga_ctrl_reg_aclk aclk = { .val = 0 };
-	u32 mask = 0;
+	union fl2000_vga_hsync_reg1 hsync1 = { .val = 0 };
+	union fl2000_vga_hsync_reg2 hsync2 = { .val = 0 };
+	union fl2000_vga_vsync_reg1 vsync1 = { .val = 0 };
+	union fl2000_vga_vsync_reg2 vsync2 = { .val = 0 };
+	unsigned int val;
+	int ret;
 
 	pll_reg.prescaler = pll->prescaler;
 	pll_reg.multiplier = pll->multiplier;
 	pll_reg.divisor = pll->divisor;
 	pll_reg.function = pll->function;
-	regmap_write(regmap, FL2000_VGA_PLL_REG, pll_reg.val);
+	ret = regmap_write(regmap, FL2000_VGA_PLL_REG, pll_reg.val);
+	if (ret)
+		return ret;
 
-	aclk.force_pll_up = true;
-	fl2000_add_bitmask(mask, union fl2000_vga_ctrl_reg_aclk, force_pll_up);
-	aclk.force_vga_connect = true;
-	fl2000_add_bitmask(mask, union fl2000_vga_ctrl_reg_aclk, force_vga_connect);
-	regmap_write_bits(regmap, FL2000_VGA_CTRL_REG_ACLK, mask, aclk.val);
+	/* App reset (self clearing) latches the PLL */
+	fl2000_reset(fl);
+	ret = regmap_read(regmap, FL2000_VGA_PLL_REG, &val);
+	if (ret)
+		return ret;
+	if (val != pll_reg.val)
+		return -EIO;
 
-	return 0;
-}
+	/* 0x803C: disable BIA (22), isoch error interrupt (24), isoch auto recover (19, 21) and
+	 * feedback interrupt (13); end of frame type (27:29) = zero length bulk packet (28).
+	 * Force VGA connect (25) is only ever pulsed by Fresco around HDMI setup, keep it off
+	 */
+	regmap_update_bits(regmap, FL2000_VGA_CTRL_REG_ACLK,
+			   BIT(22) | BIT(24) | BIT(19) | BIT(21) | BIT(13) | GENMASK(29, 27) | BIT(25),
+			   BIT(28));
 
-int fl2000_set_timings(struct fl2000_device *fl, const struct fl2000_timings *timings)
-{
-	struct regmap *regmap = fl->regmap;
-	union fl2000_vga_hsync_reg1 hsync1 = { .val = 0 };
-	union fl2000_vga_hsync_reg2 hsync2 = { .val = 0 };
-	union fl2000_vga_vsync_reg1 vsync1 = { .val = 0 };
-	union fl2000_vga_vsync_reg2 vsync2 = { .val = 0 };
+	/* 0x8004: clear 28, 16 bit modes (6: 565, 31: 555), compression (24), 8 bit (25),
+	 * palette (26), first byte mask (27); reset VGA CCS (0), external DAC on (7)
+	 */
+	regmap_update_bits(regmap, FL2000_VGA_CTRL_REG_PXCLK,
+			   BIT(28) | BIT(6) | BIT(31) | GENMASK(27, 24) | BIT(0) | BIT(7),
+			   BIT(0) | BIT(7) | (bytes_pix == 2 ? BIT(6) : 0));
 
-	hsync1.hactive = timings->hactive;
-	hsync1.htotal = timings->htotal;
+	hsync1.hactive = t->hactive;
+	hsync1.htotal = t->htotal;
 	regmap_write(regmap, FL2000_VGA_HSYNC_REG1, hsync1.val);
 
-	hsync2.hsync_width = timings->hsync_width;
-	hsync2.hstart = timings->hstart;
+	hsync2.hsync_width = t->hsync_width;
+	hsync2.hstart = t->hstart;
 	regmap_write(regmap, FL2000_VGA_HSYNC_REG2, hsync2.val);
 
-	vsync1.vactive = timings->vactive;
-	vsync1.vtotal = timings->vtotal;
+	vsync1.vactive = t->vactive;
+	vsync1.vtotal = t->vtotal;
 	regmap_write(regmap, FL2000_VGA_VSYNC_REG1, vsync1.val);
 
-	vsync2.vsync_width = timings->vsync_width;
-	vsync2.vstart = timings->vstart;
-	vsync2.start_latency = timings->vstart;
+	vsync2.vsync_width = t->vsync_width;
+	vsync2.vstart = t->vstart;
+	vsync2.start_latency = t->vstart;
 	regmap_write(regmap, FL2000_VGA_VSYNC_REG2, vsync2.val);
 
-	return 0;
-}
+	/* 0x801C: clear isoch register bits 29:16 */
+	regmap_update_bits(regmap, FL2000_VGA_ISOCH_REG, GENMASK(29, 16), 0);
 
-int fl2000_set_pixfmt(struct fl2000_device *fl, u32 bytes_pix)
-{
-	struct regmap *regmap = fl->regmap;
-	union fl2000_vga_cntrl_reg_pxclk pxclk = { .val = 0 };
-	u32 mask = 0;
+	regmap_update_bits(regmap, FL2000_USB_LPM_REG, BIT(13), BIT(13));
 
-	pxclk.dac_output_en = false;
-	fl2000_add_bitmask(mask, union fl2000_vga_cntrl_reg_pxclk, dac_output_en);
-	pxclk.drop_cnt = false;
-	fl2000_add_bitmask(mask, union fl2000_vga_cntrl_reg_pxclk, drop_cnt);
-	pxclk.vga565_mode = (bytes_pix == 2);
-	fl2000_add_bitmask(mask, union fl2000_vga_cntrl_reg_pxclk, vga565_mode);
-	pxclk.vga332_mode = false;
-	fl2000_add_bitmask(mask, union fl2000_vga_cntrl_reg_pxclk, vga332_mode);
-	pxclk.vga555_mode = false;
-	fl2000_add_bitmask(mask, union fl2000_vga_cntrl_reg_pxclk, vga555_mode);
-	pxclk.vga_compress = false;
-	fl2000_add_bitmask(mask, union fl2000_vga_cntrl_reg_pxclk, vga_compress);
-	pxclk.dac_output_en = true;
-	fl2000_add_bitmask(mask, union fl2000_vga_cntrl_reg_pxclk, dac_output_en);
-	pxclk.clear_watermark = true;
-	fl2000_add_bitmask(mask, union fl2000_vga_cntrl_reg_pxclk, clear_watermark);
-	regmap_write_bits(regmap, FL2000_VGA_CTRL_REG_PXCLK, mask, pxclk.val);
-
-	return 0;
-}
-
-int fl2000_set_transfers(struct fl2000_device *fl)
-{
-	struct regmap *regmap = fl->regmap;
-	union fl2000_vga_ctrl_reg_aclk aclk = { .val = 0 };
-	union fl2000_vga_isoch_reg isoch = { .val = 0 };
-	u32 mask;
-
-	mask = 0;
-	aclk.use_pkt_pending = false;
-	fl2000_add_bitmask(mask, union fl2000_vga_ctrl_reg_aclk, use_pkt_pending);
-	aclk.use_zero_td = false;
-	fl2000_add_bitmask(mask, union fl2000_vga_ctrl_reg_aclk, use_zero_td);
-	aclk.use_zero_pkt_len = true;
-	fl2000_add_bitmask(mask, union fl2000_vga_ctrl_reg_aclk, use_zero_pkt_len);
-	aclk.vga_err_int_en = true;
-	regmap_write_bits(regmap, FL2000_VGA_CTRL_REG_ACLK, mask, aclk.val);
-
-	mask = 0;
-	isoch.mframe_cnt = 0;
-	fl2000_add_bitmask(mask, union fl2000_vga_isoch_reg, mframe_cnt);
-	regmap_write_bits(regmap, FL2000_VGA_ISOCH_REG, mask, isoch.val);
-
-	return 0;
+	/* Re-selecting the streaming altsetting resets bulk endpoint state on both sides, which
+	 * is left mid-frame when the previous mode's transfers were killed
+	 */
+	return usb_set_interface(fl->udev, FL2000_USBIF_AVCONTROL, FL2000_STREAMING_ALTSETTING);
 }
 
 int fl2000_reset(struct fl2000_device *fl)
@@ -221,19 +193,6 @@ int fl2000_reset(struct fl2000_device *fl)
 	regmap_write_bits(regmap, FL2000_RST_CTRL_REG, mask, rst_cntrl_reg.val);
 
 	msleep(FL2000_HW_RST_MDELAY);
-
-	return 0;
-}
-
-int fl2000_afe_magic(struct fl2000_device *fl)
-{
-	struct regmap *regmap = fl->regmap;
-	union fl2000_usb_lpm_reg usb_lpm_reg = { .val = 0 };
-	u32 mask = 0;
-
-	usb_lpm_reg.magic = true;
-	fl2000_add_bitmask(mask, union fl2000_usb_lpm_reg, magic);
-	regmap_write_bits(regmap, FL2000_USB_LPM_REG, mask, usb_lpm_reg.val);
 
 	return 0;
 }

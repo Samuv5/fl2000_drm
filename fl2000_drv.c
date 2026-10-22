@@ -8,12 +8,14 @@
  */
 
 #include <linux/module.h>
+#include <linux/slab.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_shmem.h>
 #include <drm/drm_gem_shmem_helper.h>
+#include <drm/drm_managed.h>
 #include <drm/drm_modeset_helper.h>
 #include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
@@ -23,9 +25,7 @@
 #define USB_VENDOR_FRESCO_LOGIC 0x1D5C
 #define USB_PRODUCT_FL2000	0x2000
 
-/* Interface 0 altsetting 1 provides bulk OUT endpoint 1 used for frame streaming */
-#define FL2000_USBIF_AVCONTROL	  0
-#define FL2000_STREAMING_ALTSETTING 1
+#define FL2000_USBIF_INTERRUPT 2
 
 DEFINE_DRM_GEM_FOPS(fl2000_fops);
 
@@ -61,6 +61,108 @@ static int fl2000_hw_init(struct fl2000_device *fl)
 		return ret;
 
 	return fl2000_usb_magic(fl);
+}
+
+/*
+ * Interrupt endpoint (EP3 IN of interface 2): FL2000 signals VGA status changes there. As in
+ * Fresco's driver every interrupt is acknowledged by reading the status register, which also
+ * clears its event bits; left unserviced the interrupt packets pile up in the device.
+ */
+static void fl2000_intr_work(struct work_struct *work)
+{
+	struct fl2000_device *fl = container_of(work, struct fl2000_device, intr_work);
+	union fl2000_vga_status_reg status = {};
+	int idx, ret;
+
+	if (!drm_dev_enter(&fl->drm, &idx))
+		return;
+
+	if (!regmap_read(fl->regmap, FL2000_VGA_STATUS_REG, &status.val)) {
+		dev_dbg(&fl->intf->dev, "interrupt, status 0x%08x\n", status.val);
+		if (status.monitor_event || status.edid_event || status.hdmi_event)
+			drm_kms_helper_hotplug_event(&fl->drm);
+	}
+
+	ret = usb_submit_urb(fl->intr_urb, GFP_KERNEL);
+	if (ret && ret != -EPERM && ret != -ENODEV)
+		drm_err(&fl->drm, "Interrupt URB submission failed (%d)\n", ret);
+
+	drm_dev_exit(idx);
+}
+
+static void fl2000_intr_complete(struct urb *urb)
+{
+	struct fl2000_device *fl = urb->context;
+
+	switch (urb->status) {
+	case -ENOENT: /* Killed */
+	case -ECONNRESET:
+	case -ESHUTDOWN: /* Unplugged */
+	case -ENODEV:
+		return;
+	default:
+		/* Also errors: the work reads status and resubmits */
+		schedule_work(&fl->intr_work);
+	}
+}
+
+static void fl2000_intr_stop(struct fl2000_device *fl)
+{
+	if (!fl->intr_urb)
+		return;
+
+	/* Poisoned URB cannot be resubmitted by the work */
+	usb_poison_urb(fl->intr_urb);
+	cancel_work_sync(&fl->intr_work);
+}
+
+static void fl2000_intr_start(struct fl2000_device *fl)
+{
+	int ret;
+
+	if (!fl->intr_urb)
+		return;
+
+	ret = usb_submit_urb(fl->intr_urb, GFP_KERNEL);
+	if (ret)
+		drm_err(&fl->drm, "Interrupt URB submission failed (%d)\n", ret);
+}
+
+static void fl2000_intr_release(struct drm_device *drm, void *data)
+{
+	struct fl2000_device *fl = data;
+
+	fl2000_intr_stop(fl);
+	usb_free_urb(fl->intr_urb);
+	kfree(fl->intr_buf);
+}
+
+static int fl2000_intr_init(struct fl2000_device *fl)
+{
+	struct usb_interface *iface = usb_ifnum_to_if(fl->udev, FL2000_USBIF_INTERRUPT);
+	struct usb_endpoint_descriptor *ep;
+
+	INIT_WORK(&fl->intr_work, fl2000_intr_work);
+
+	if (!iface || usb_find_int_in_endpoint(iface->cur_altsetting, &ep)) {
+		drm_warn(&fl->drm, "No interrupt endpoint, monitor changes are polled\n");
+		return 0;
+	}
+
+	fl->intr_buf = kmalloc(usb_endpoint_maxp(ep), GFP_KERNEL);
+	fl->intr_urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!fl->intr_buf || !fl->intr_urb) {
+		usb_free_urb(fl->intr_urb);
+		fl->intr_urb = NULL;
+		kfree(fl->intr_buf);
+		return -ENOMEM;
+	}
+
+	usb_fill_int_urb(fl->intr_urb, fl->udev, usb_rcvintpipe(fl->udev, ep->bEndpointAddress),
+			 fl->intr_buf, usb_endpoint_maxp(ep), fl2000_intr_complete, fl,
+			 ep->bInterval);
+
+	return drmm_add_action_or_reset(&fl->drm, fl2000_intr_release, fl);
 }
 
 static int fl2000_probe(struct usb_interface *intf, const struct usb_device_id *id)
@@ -135,6 +237,10 @@ static int fl2000_probe(struct usb_interface *intf, const struct usb_device_id *
 	if (ret)
 		return ret;
 
+	ret = fl2000_intr_init(fl);
+	if (ret)
+		return ret;
+
 	ret = fl2000_modeset_init(fl);
 	if (ret)
 		return ret;
@@ -146,6 +252,7 @@ static int fl2000_probe(struct usb_interface *intf, const struct usb_device_id *
 		return ret;
 
 	drm_client_setup(drm, NULL);
+	fl2000_intr_start(fl);
 
 	return 0;
 }
@@ -155,6 +262,7 @@ static void fl2000_disconnect(struct usb_interface *intf)
 	struct fl2000_device *fl = usb_get_intfdata(intf);
 	struct drm_device *drm = &fl->drm;
 
+	fl2000_intr_stop(fl);
 	drm_kms_helper_poll_fini(drm);
 	drm_dev_unplug(drm);
 	drm_atomic_helper_shutdown(drm);
@@ -164,6 +272,7 @@ static int fl2000_suspend(struct usb_interface *intf, pm_message_t message)
 {
 	struct fl2000_device *fl = usb_get_intfdata(intf);
 
+	fl2000_intr_stop(fl);
 	return drm_mode_config_helper_suspend(&fl->drm);
 }
 
@@ -178,6 +287,9 @@ static int fl2000_resume(struct usb_interface *intf)
 	if (ret)
 		drm_err(&fl->drm, "Hardware re-initialization failed (%d)\n", ret);
 
+	if (fl->intr_urb)
+		usb_unpoison_urb(fl->intr_urb);
+	fl2000_intr_start(fl);
 	return drm_mode_config_helper_resume(&fl->drm);
 }
 

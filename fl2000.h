@@ -35,7 +35,10 @@
 
 #define DRIVER_NAME "fl2000"
 
-#define FL2000_EP_STREAM 1
+/* Interface 0 altsetting 1 provides bulk OUT endpoint 1 used for frame streaming */
+#define FL2000_USBIF_AVCONTROL	    0
+#define FL2000_STREAMING_ALTSETTING 1
+#define FL2000_EP_STREAM	    1
 
 /* Streaming: buffers in flight never exceed URB count, plus the latest frame, plus one to draw */
 #define FL2000_STREAM_URBS 2
@@ -99,7 +102,16 @@ struct fl2000_device {
 	struct drm_connector connector;
 
 	struct fl2000_it66121 *hdmi; /* NULL when there is no IT66121 (VGA only) */
+
+	/* Current mode, to resynchronize the device after a failed transfer */
+	struct fl2000_pll mode_pll;
+	struct fl2000_timings mode_timings;
+	u32 mode_bytes_pix;
 	struct fl2000_stream stream;
+
+	struct urb *intr_urb;
+	u8 *intr_buf;
+	struct work_struct intr_work;
 };
 
 static inline struct fl2000_device *to_fl2000(struct drm_device *drm)
@@ -128,11 +140,8 @@ static inline struct fl2000_device *to_fl2000(struct drm_device *drm)
 int fl2000_regmap_init(struct fl2000_device *fl);
 int fl2000_reset(struct fl2000_device *fl);
 int fl2000_usb_magic(struct fl2000_device *fl);
-int fl2000_afe_magic(struct fl2000_device *fl);
-int fl2000_set_transfers(struct fl2000_device *fl);
-int fl2000_set_pixfmt(struct fl2000_device *fl, u32 bytes_pix);
-int fl2000_set_timings(struct fl2000_device *fl, const struct fl2000_timings *timings);
-int fl2000_set_pll(struct fl2000_device *fl, const struct fl2000_pll *pll);
+int fl2000_set_mode(struct fl2000_device *fl, const struct fl2000_pll *pll,
+		    const struct fl2000_timings *t, u32 bytes_pix);
 int fl2000_i2c_dword(struct fl2000_device *fl, bool read, u16 addr, u8 offset, u32 *data);
 
 /* fl2000_modeset.c */

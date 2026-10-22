@@ -9,11 +9,14 @@
  * (C) Copyright 2026, Samuel
  */
 
+#include <linux/ktime.h>
 #include <linux/math64.h>
+#include <linux/module.h>
 #include <linux/slab.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_cache.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
@@ -27,6 +30,7 @@
 #include <drm/drm_probe_helper.h>
 
 #include "fl2000.h"
+#include "fl2000_convert.h"
 
 /* IT66121 is a single link TMDS transmitter, 165 MHz max; FL2000DX itself targets 1080p60 */
 #define FL2000_MAX_CLOCK_KHZ 165000
@@ -43,15 +47,18 @@
 #define FL2000_VCOCLOCK_MIN 62500000 /* 62.5 MHz */
 #define FL2000_VCOCLOCK_MAX 1000000000 /* 1GHz */
 
-/* Maximum acceptable ppm error */
-#define FL2000_PPM_ERR_MAX 500
-
-/* How far htotal may be stretched to get a pixel clock the PLL can produce */
-#define FL2000_MAX_H_ADJUSTMENT 10
+/* Maximum acceptable pixel clock error: VESA DMT tolerance is 0.5%. Timings themselves are never
+ * altered, VGA monitors and VGA-to-HDMI converters sample assuming standard htotal
+ */
+#define FL2000_PPM_ERR_MAX 5000
 
 /* Assume bulk transfers can use only 80% of USB bandwidth, bytes per second */
 #define FL2000_BW_HIGH_SPEED  (480000000ULL * 80 / 100 / 8)
 #define FL2000_BW_SUPER_SPEED (5000000000ULL * 80 / 100 / 8)
+
+static unsigned int max_bpp = 24;
+module_param(max_bpp, uint, 0644);
+MODULE_PARM_DESC(max_bpp, "Maximum bits per pixel sent over USB: 24 or 16 (default 24)");
 
 /* VGA monitor DDC (EDID EEPROM) on the FL2000 I2C bus */
 #define FL2000_VGA_DDC_ADDR 0x50
@@ -126,38 +133,18 @@ static u64 fl2000_pll_calc(u64 clock_mil, struct fl2000_pll *pll, u32 *clock_cal
 	return min_ppm_err;
 }
 
-static int fl2000_mode_calc(const struct drm_display_mode *mode,
-			    struct drm_display_mode *adjusted_mode, struct fl2000_pll *pll)
+static int fl2000_mode_calc(const struct drm_display_mode *mode, struct fl2000_pll *pll)
 {
-	const u64 clock_mil = (u64)mode->clock * 1000 * FL2000_PLL_PRECISION;
 	u32 clock_calculated;
 
-	if (mode->clock <= 0 || mode->clock > FL2000_MAX_CLOCK_KHZ || !mode->htotal)
+	if (mode->clock <= 0 || mode->clock > FL2000_MAX_CLOCK_KHZ)
 		return -EINVAL;
 
-	/* Try to match pixel clock slightly adjusting htotal value: 0, -1, 1, -2, 2, ... */
-	for (int m = 0; m <= FL2000_MAX_H_ADJUSTMENT * 2; m++) {
-		int d = (m & 1) ? -((m + 1) / 2) : m / 2;
-		u64 clock_mil_adjusted;
+	if (fl2000_pll_calc((u64)mode->clock * 1000 * FL2000_PLL_PRECISION, pll,
+			    &clock_calculated) >= FL2000_PPM_ERR_MAX)
+		return -ERANGE;
 
-		if (mode->htotal + d <= mode->hsync_end)
-			continue;
-
-		clock_mil_adjusted = div_u64(clock_mil * (mode->htotal + d), mode->htotal);
-
-		if (fl2000_pll_calc(clock_mil_adjusted, pll, &clock_calculated) <
-		    FL2000_PPM_ERR_MAX) {
-			if (adjusted_mode) {
-				drm_mode_copy(adjusted_mode, mode);
-				adjusted_mode->htotal += d;
-				adjusted_mode->clock = clock_calculated / 1000;
-			}
-			return 0;
-		}
-	}
-
-	/* Cannot find PLL configuration that satisfy requirements */
-	return -ERANGE;
+	return 0;
 }
 
 /* 3 (RGB888) or 2 (RGB565) bytes per pixel depending on USB bandwidth, 0 if mode is too fast */
@@ -188,35 +175,14 @@ static unsigned int fl2000_bytes_pix(struct fl2000_device *fl, const struct drm_
 		return 0;
 
 	bytes_pix = div64_u64(max_bw, rate);
-	if (bytes_pix >= 3)
+	if (bytes_pix >= 3 && max_bpp >= 24)
 		return 3;
-	if (bytes_pix == 2)
+	if (bytes_pix >= 2)
 		return 2;
 	return 0;
 }
 
 /* ---- Pixel conversion ---- */
-
-/* HW expects 32-bit halves of every 64-bit word of the stream swapped, hence "^ 4" */
-static void fl2000_convert_line(u8 *dst, size_t off, const u32 *src, unsigned int pixels,
-				unsigned int bytes_pix)
-{
-	for (unsigned int x = 0; x < pixels; x++) {
-		u32 p = src[x];
-
-		if (bytes_pix == 3) {
-			dst[off++ ^ 4] = p;
-			dst[off++ ^ 4] = p >> 8;
-			dst[off++ ^ 4] = p >> 16;
-		} else {
-			u16 v = ((p & 0x00F80000) >> 8) | ((p & 0x0000FC00) >> 5) |
-				((p & 0x000000F8) >> 3);
-
-			dst[off++ ^ 4] = v;
-			dst[off++ ^ 4] = v >> 8;
-		}
-	}
-}
 
 static void fl2000_convert(struct fl2000_device *fl, int idx, const struct iosys_map *map,
 			   const struct drm_framebuffer *fb, const struct drm_rect *clip, int src_x,
@@ -233,8 +199,20 @@ static void fl2000_convert(struct fl2000_device *fl, int idx, const struct iosys
 		if (dx < 0 || dy < 0 || dx + pixels > stream->width || dy >= stream->height)
 			continue;
 
-		iosys_map_memcpy_from(line, map, y * fb->pitches[0] + clip->x1 * 4, pixels * 4);
-		fl2000_convert_line(dst, ((size_t)dy * stream->width + dx) * stream->bytes_pix, line,
+		/* The framebuffer usually is GPU memory mapped write-combined, where plain CPU
+		 * reads crawl. drm_memcpy_from_wc() uses streaming loads when source and length
+		 * are 16-byte aligned, so copy from a 4-pixel aligned start
+		 */
+		unsigned int ax1 = clip->x1 & ~3;
+		size_t len = min_t(size_t, ALIGN((clip->x2 - ax1) * 4, 16),
+				   fb->pitches[0] - ax1 * 4);
+		struct iosys_map src = *map;
+		struct iosys_map tmp = IOSYS_MAP_INIT_VADDR(line);
+
+		iosys_map_incr(&src, (size_t)y * fb->pitches[0] + ax1 * 4);
+		drm_memcpy_from_wc(&tmp, &src, len);
+
+		fl2000_convert_line(dst, (size_t)dy * stream->width + dx, line + (clip->x1 - ax1),
 				    pixels, stream->bytes_pix);
 	}
 }
@@ -264,6 +242,7 @@ static void fl2000_plane_atomic_update(struct drm_plane *plane, struct fl2000_at
 	int src_y = new_state->src.y1 >> 16;
 	struct drm_rect clip;
 	u32 *line;
+	ktime_t start;
 	bool full;
 	int idx, buf;
 
@@ -276,7 +255,8 @@ static void fl2000_plane_atomic_update(struct drm_plane *plane, struct fl2000_at
 	if (!drm_dev_enter(plane->dev, &idx))
 		return;
 
-	line = kmalloc_array(drm_rect_width(&clip), sizeof(*line), GFP_KERNEL);
+	/* Room for the 4-pixel alignment on both ends */
+	line = kmalloc_array(drm_rect_width(&clip) + 8, sizeof(*line), GFP_KERNEL);
 	if (!line)
 		goto out;
 
@@ -286,10 +266,14 @@ static void fl2000_plane_atomic_update(struct drm_plane *plane, struct fl2000_at
 	full = clip.x1 <= src_x && clip.y1 <= src_y &&
 	       clip.x2 >= src_x + (int)fl->stream.width && clip.y2 >= src_y + (int)fl->stream.height;
 
+	start = ktime_get();
 	buf = fl2000_stream_begin(fl, full);
 	if (buf >= 0) {
 		fl2000_convert(fl, buf, &shadow->data[0], fb, &clip, src_x, src_y, line);
 		fl2000_stream_end(fl, buf);
+		dev_dbg_ratelimited(&fl->intf->dev, "update " DRM_RECT_FMT "%s: %lld us\n",
+				    DRM_RECT_ARG(&clip), full ? " full" : "",
+				    ktime_us_delta(ktime_get(), start));
 	}
 
 	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
@@ -318,7 +302,6 @@ static enum drm_mode_status fl2000_crtc_mode_valid(struct drm_crtc *crtc,
 						   const struct drm_display_mode *mode)
 {
 	struct fl2000_device *fl = to_fl2000(crtc->dev);
-	struct drm_display_mode adjusted_mode;
 	struct fl2000_pll pll;
 
 	if (mode->clock > FL2000_MAX_CLOCK_KHZ)
@@ -327,21 +310,13 @@ static enum drm_mode_status fl2000_crtc_mode_valid(struct drm_crtc *crtc,
 	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
 		return MODE_NO_INTERLACE;
 
-	if (fl2000_mode_calc(mode, &adjusted_mode, &pll))
+	if (fl2000_mode_calc(mode, &pll))
 		return MODE_CLOCK_RANGE;
 
-	if (!fl2000_bytes_pix(fl, &adjusted_mode))
+	if (!fl2000_bytes_pix(fl, mode))
 		return MODE_CLOCK_HIGH;
 
 	return MODE_OK;
-}
-
-static bool fl2000_crtc_mode_fixup(struct drm_crtc *crtc, const struct drm_display_mode *mode,
-				   struct drm_display_mode *adjusted_mode)
-{
-	struct fl2000_pll pll;
-
-	return !fl2000_mode_calc(mode, adjusted_mode, &pll);
 }
 
 static int fl2000_crtc_atomic_check(struct drm_crtc *crtc, struct fl2000_atomic_state *state)
@@ -367,9 +342,8 @@ static void fl2000_crtc_atomic_enable(struct drm_crtc *crtc, struct fl2000_atomi
 	if (!drm_dev_enter(crtc->dev, &idx))
 		return;
 
-	/* Adjusted mode already has a PLL-friendly clock, this just recomputes the dividers */
 	bytes_pix = fl2000_bytes_pix(fl, mode);
-	if (fl2000_mode_calc(mode, NULL, &pll) || !bytes_pix) {
+	if (fl2000_mode_calc(mode, &pll) || !bytes_pix) {
 		drm_err(crtc->dev, "Mode " DRM_MODE_FMT " cannot be set\n", DRM_MODE_ARG(mode));
 		goto out;
 	}
@@ -386,12 +360,15 @@ static void fl2000_crtc_atomic_enable(struct drm_crtc *crtc, struct fl2000_atomi
 	timings.vsync_width = mode->vsync_end - mode->vsync_start;
 	timings.vstart = mode->vtotal - mode->vsync_start + 1;
 
-	fl2000_set_pll(fl, &pll);
-	fl2000_reset(fl);
-	fl2000_set_timings(fl, &timings);
-	fl2000_set_pixfmt(fl, bytes_pix);
-	fl2000_set_transfers(fl);
-	fl2000_afe_magic(fl);
+	fl->mode_pll = pll;
+	fl->mode_timings = timings;
+	fl->mode_bytes_pix = bytes_pix;
+
+	ret = fl2000_set_mode(fl, &pll, &timings, bytes_pix);
+	if (ret) {
+		drm_err(crtc->dev, "Cannot program mode (%d)\n", ret);
+		goto out;
+	}
 
 	ret = fl2000_stream_start(fl, mode->hdisplay, mode->vdisplay, bytes_pix);
 	if (ret)
@@ -418,7 +395,6 @@ static void fl2000_crtc_atomic_disable(struct drm_crtc *crtc, struct fl2000_atom
 
 static const struct drm_crtc_helper_funcs fl2000_crtc_helper_funcs = {
 	.mode_valid = fl2000_crtc_mode_valid,
-	.mode_fixup = fl2000_crtc_mode_fixup,
 	.atomic_check = fl2000_crtc_atomic_check,
 	.atomic_enable = fl2000_crtc_atomic_enable,
 	.atomic_disable = fl2000_crtc_atomic_disable,
