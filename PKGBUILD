@@ -1,6 +1,6 @@
 # Build from a checkout of this repository: makepkg -si
 pkgname=fl2000-dkms
-pkgver=1.0.0
+pkgver=1.0.1
 pkgrel=1
 pkgdesc="DRM driver for Fresco Logic FL2000 USB 3.0 to VGA/HDMI adapters (DKMS)"
 arch=('any')
