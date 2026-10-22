@@ -1,75 +1,81 @@
-# fl2000 — driver DRM para adaptadores USB 3.0 Fresco Logic FL2000
+# fl2000 — DRM driver for Fresco Logic FL2000 USB 3.0 display adapters
 
-Driver de kernel Linux para los adaptadores USB 3.0 a VGA / HDMI basados en el chip
-**Fresco Logic FL2000DX** (USB ID `1d5c:2000`). El adaptador aparece como una tarjeta de video
-más (`/dev/dri/cardN`), así que funciona con cualquier escritorio: GNOME y KDE en Wayland,
-Cinnamon y otros en X11, y la consola de texto.
+[Español](README.es.md)
 
-Probado con un adaptador Steren VGA+HDMI en CachyOS (kernel 7.2, clang) con GNOME Wayland a
-1920x1080 @ 60 Hz. Compila también en kernels LTS 6.18 y en 7.0 con gcc.
+Linux kernel driver for USB 3.0 to VGA / HDMI adapters based on the **Fresco Logic FL2000DX**
+chip (USB ID `1d5c:2000`). The adapter shows up as one more graphics card (`/dev/dri/cardN`), so
+it works with any desktop: GNOME and KDE on Wayland, Cinnamon and others on X11, and the text
+console.
 
-## Instalación (CachyOS / Arch)
+Tested with a Steren VGA+HDMI adapter on CachyOS (kernel 7.2, clang) running GNOME Wayland at
+1920x1080 @ 60 Hz. Also builds on 6.18 LTS kernels and on 7.0 with gcc.
+
+## Installation (CachyOS / Arch)
 
 ```sh
-sudo pacman -S --needed base-devel dkms linux-cachyos-headers   # o los headers de tu kernel
+sudo pacman -S --needed base-devel dkms linux-cachyos-headers   # or your kernel's headers
 git clone https://github.com/Samuv5/fl2000_drm
 cd fl2000_drm
 makepkg -si
 ```
 
-El paquete `fl2000-dkms` recompila el módulo automáticamente en cada actualización de kernel
-(detecta solo si el kernel se compiló con clang). Conecta el adaptador y listo; si tu sesión
-gráfica ya estaba abierta, cierra sesión y vuelve a entrar para que el escritorio lo tome.
+The `fl2000-dkms` package rebuilds the module automatically on every kernel update (it detects
+clang-built kernels on its own). Plug in the adapter and you are done; if your desktop session
+was already running, log out and back in so the desktop picks it up.
 
-### Otras distribuciones / prueba sin instalar
+### Other distributions / try without installing
 
 ```sh
 make
 sudo insmod fl2000.ko
 ```
 
-## Uso y ajustes
+## Usage and settings
 
-- Resolución y posición: en la configuración de pantallas del escritorio.
-- `max_bpp`: bits por pixel enviados por USB, `24` (predeterminado) o `16`. Con 16 se usa la
-  mitad del ancho de banda, útil en puertos USB lentos o hubs:
-  `echo 16 | sudo tee /sys/module/fl2000/parameters/max_bpp` (aplica en el siguiente cambio de
-  modo) o `options fl2000 max_bpp=16` en `/etc/modprobe.d/fl2000.conf`.
-- Mensajes de depuración: `sudo insmod fl2000.ko dyndbg=+p`.
+- Resolution and layout: in your desktop's display settings.
+- `max_bpp`: bits per pixel sent over USB, `24` (default) or `16`. 16 uses half the bandwidth,
+  useful on slow USB ports or hubs:
+  `echo 16 | sudo tee /sys/module/fl2000/parameters/max_bpp` (applies on the next mode change)
+  or `options fl2000 max_bpp=16` in `/etc/modprobe.d/fl2000.conf`.
+- Debug messages: `sudo insmod fl2000.ko dyndbg=+p`.
 
-## Limitaciones conocidas
+## Known limitations
 
-- Necesita USB 3.0. En USB 2.0 solo caben resoluciones muy pequeñas.
-- Si el adaptador no da acceso al EDID del monitor (como el Steren probado), se detecta el
-  monitor por carga eléctrica en VGA y se ofrecen resoluciones estándar hasta 1920x1200.
-- Adaptadores HDMI con chip ITE IT66121: soporte portado del driver original, sin probar en
-  hardware. Los que convierten VGA a HDMI con otro chip funcionan como VGA.
-- Sin audio por HDMI.
-- GNOME no siempre toma el adaptador si se conecta con la sesión ya abierta (limitación de
-  mutter): cierra sesión y vuelve a entrar.
+- Needs USB 3.0. Over USB 2.0 only very small resolutions fit.
+- If the adapter gives no access to the monitor's EDID (like the tested Steren), the VGA monitor
+  is detected by load sensing and standard modes up to 1920x1200 are offered.
+- HDMI adapters with an ITE IT66121 chip: support ported from the original driver, untested on
+  hardware. Adapters that convert VGA to HDMI with another chip work as VGA.
+- No HDMI audio.
+- GNOME does not always pick up the adapter when it is plugged in during a session (a mutter
+  limitation): log out and back in.
 
-## Diseño
+## Design
 
-Un solo módulo (`fl2000.ko`) siguiendo el patrón de los drivers USB del kernel (`udl`, `gud`):
-GEM SHMEM con plano "shadow", PRIME para recibir la imagen de la GPU principal, sin vblank real.
-La secuencia de configuración del chip y el protocolo de streaming siguen el
-[driver oficial de Fresco Logic](https://github.com/FrescoLogic/FL2000).
+A single module (`fl2000.ko`) following the pattern of the kernel's USB display drivers (`udl`,
+`gud`): GEM SHMEM with a shadow plane, PRIME to receive the image from the main GPU, no real
+vblank. The chip programming sequence and the streaming protocol follow
+[Fresco Logic's reference driver](https://github.com/FrescoLogic/FL2000).
 
-| Archivo | Contenido |
+| File | Contents |
 |---|---|
-| `fl2000_drv.c` | Dispositivo USB y DRM, endpoint de interrupciones, suspensión |
-| `fl2000_modeset.c` | Plano, CRTC, conector, cálculo de PLL, detección de monitor |
-| `fl2000_stream.c` | Envío continuo de frames por bulk USB |
-| `fl2000_regs.c` | Registros del chip, secuencia de modo, maestro I2C |
-| `fl2000_convert.h` | Conversión XRGB8888 → RGB888/RGB565 del chip (prueba en `test/`) |
-| `fl2000_it66121.c` | Transmisor HDMI IT66121 opcional |
+| `fl2000_drv.c` | USB and DRM device, interrupt endpoint, suspend |
+| `fl2000_modeset.c` | Plane, CRTC, connector, PLL calculation, monitor detection |
+| `fl2000_stream.c` | Continuous frame streaming over USB bulk |
+| `fl2000_regs.c` | Chip registers, mode sequence, I2C master |
+| `fl2000_convert.h` | XRGB8888 → chip RGB888/RGB565 conversion (test in `test/`) |
+| `fl2000_it66121.c` | Optional IT66121 HDMI transmitter |
 
-Prueba de la conversión de pixeles: `cc -O2 -o /tmp/t test/convert_test.c && /tmp/t`
+Pixel conversion test: `cc -O2 -o /tmp/t test/convert_test.c && /tmp/t`
 
-## Créditos
+## Credits
 
-- **Artem Mygaiev** (klogg/fl2000_drm): driver DRM original en el que se basa este.
-- **Fresco Logic**: driver de referencia y definición de registros.
-- **Samuel**: reescritura para kernels actuales (2026).
+- **Artem Mygaiev** (klogg/fl2000_drm): original DRM driver this one is based on.
+- **Fresco Logic**: reference driver and register definitions.
+- **Samuel**: rewrite for current kernels (2026).
 
-Licencia: GPL-2.0, ver [LICENSE](LICENSE).
+License: GPL-2.0, see [LICENSE](LICENSE).
+
+---
+
+Thanks Claude for cleaning this trash, been 1 year without a 2nd monitor and no model fixed it like you did, yay!
